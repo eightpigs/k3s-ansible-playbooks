@@ -1,0 +1,156 @@
+- hosts: k3s
+  remote_user: dev
+  become: yes
+  gather_facts: False
+  tasks:
+    - set_fact: 
+        k3s_version: "v1.21.2+k3s1"
+        ip_link: ens18
+    - name: Output K3s Version
+      debug: msg="{{ k3s_version }}"
+      when: k3s_version is defined
+    - name: Download K3s
+      shell: |
+        ls /usr/local/bin/k3s > /dev/null 2>&1 || wget "https://github.com/k3s-io/k3s/releases/download/{{ k3s_version }}/k3s" -O /usr/local/bin/k3s
+        chmod +x /usr/local/bin/k3s
+      when: k3s_version is defined
+    - name: Install Wireguard
+      shell: |
+        which wg > /dev/null 2>&1 || apt install wireguard -y
+
+- hosts: k3s-master
+  remote_user: dev
+  become: yes
+  gather_facts: False
+  tasks:
+    - name: Check K3s Server Installed
+      shell: ls /etc/systemd/system/k3s.service > /dev/null 2>&1 && echo 1 || echo 0
+      register: server_installed
+    - name: Get IP
+      shell: ip addr show {{ ip_link }} | grep inet | head -n 1 | awk '{print $2}' | sed -e 's/\/[0-9]\+//g'
+      register: ip_addr
+    - name: Output IP Addr
+      debug: msg="IP {{ ip_addr.stdout }}; Installed {{ server_installed.stdout }}"
+      when: ip_addr is defined and ip_addr.rc == 0
+    - name: Create K3s.service.env
+      command: touch /etc/systemd/system/k3s.service.env
+      when: server_installed is defined and server_installed.stdout == '0'
+    - name: Create K3s Server System Unit
+      when: ip_addr is defined and ip_addr.rc == 0 and server_installed is defined and server_installed.stdout == '0'
+      shell: |
+        cat > /etc/systemd/system/k3s.service <<EOF
+        [Unit]
+        Description=Lightweight Kubernetes
+        Documentation=https://k3s.io
+        Wants=network-online.target
+
+        [Install]
+        WantedBy=multi-user.target
+
+        [Service]
+        Type=notify
+        EnvironmentFile=/etc/systemd/system/k3s.service.env
+        KillMode=process
+        Delegate=yes
+        # Having non-zero Limit*s causes performance problems due to accounting overhead
+        # in the kernel. We recommend using cgroups to do container-local accounting.
+        LimitNOFILE=1048576
+        LimitNPROC=infinity
+        LimitCORE=infinity
+        TasksMax=infinity
+        TimeoutStartSec=0
+        Restart=always
+        RestartSec=5s
+        ExecStartPre=-/sbin/modprobe br_netfilter
+        ExecStartPre=-/sbin/modprobe overlay
+        ExecStart=/usr/local/bin/k3s \
+            server \
+            --tls-san {{ ip_addr.stdout }} \
+            --node-ip {{ ip_addr.stdout }} \
+            --node-external-ip {{ ip_addr.stdout }} \
+            --no-deploy servicelb \
+            --write-kubeconfig-mode=644 \
+            --flannel-backend wireguard \
+            --kube-proxy-arg "proxy-mode=ipvs" "masquerade-all=true" \
+            --kube-proxy-arg "metrics-bind-address=0.0.0.0"
+        EOF
+    - name: Enable K3s Systemed
+      command: systemctl enable k3s --now
+      when: server_installed is defined and server_installed.stdout == '0'
+    - name: get server token
+      command: cat /var/lib/rancher/k3s/server/node-token
+      register: server_token
+    - name: output server token
+      debug: msg="{{ server_token.stdout }}"
+      when: server_token is defined and server_token.rc == 0
+
+
+- hosts: k3s-workers
+  remote_user: dev
+  become: yes
+  gather_facts: False
+  vars_prompt:
+    - name: "server_token"
+      prompt: "Please input server_token"
+      private: no
+    - name: "k3s_server_ip"
+      prompt: "Please input k3s server ip"
+      private: no
+  tasks:
+    - name: Check K3s Agent Installed
+      shell: ls /etc/systemd/system/k3s-agent.service > /dev/null 2>&1 && echo 1 || echo 0
+      register: agent_installed
+    - name: output server token
+      debug: msg="{{ server_token }}"
+      when: server_token is defined
+    - name: output server ip
+      debug: msg="{{ k3s_server_ip }}"
+      when: k3s_server_ip is defined
+    - name: Get IP
+      shell: ip addr show {{ ip_link }} | grep inet | head -n 1 | awk '{print $2}' | sed -e 's/\/[0-9]\+//g'
+      register: ip_addr
+    - name: Output IP Addr
+      debug: msg="{{ ip_addr }}"
+      when: ip_addr is defined and ip_addr.rc == 0
+    - name: Create K3s.agent.env
+      shell: |
+        cat > /etc/systemd/system/k3s-agent.service.env <<EOF
+        K3S_URL=https://{{ k3s_server_ip }}:6443
+        K3S_TOKEN={{ server_token }}
+        EOF
+      when: k3s_server_ip is defined and server_token is defined and agent_installed is defined and agent_installed.stdout == '0'
+    - name: Create K3s Agent System Unit
+      when: k3s_server_ip is defined and server_token is defined and agent_installed is defined and agent_installed.stdout == '0'
+      shell: |
+        cat > /etc/systemd/system/k3s-agent.service <<EOF
+        [Unit]
+        Description=Lightweight Kubernetes
+        Documentation=https://k3s.io
+        Wants=network-online.target
+
+        [Install]
+        WantedBy=multi-user.target
+
+        [Service]
+        Type=exec
+        EnvironmentFile=/etc/systemd/system/k3s-agent.service.env
+        KillMode=process
+        Delegate=yes
+        LimitNOFILE=infinity
+        LimitNPROC=infinity
+        LimitCORE=infinity
+        TasksMax=infinity
+        TimeoutStartSec=0
+        Restart=always
+        RestartSec=5s
+        ExecStartPre=-/sbin/modprobe br_netfilter
+        ExecStartPre=-/sbin/modprobe overlay
+        ExecStart=/usr/local/bin/k3s agent \
+            --node-external-ip {{ ip_addr.stdout }} \
+            --node-ip {{ ip_addr.stdout }} \
+            --kube-proxy-arg "proxy-mode=ipvs" "masquerade-all=true" \
+            --kube-proxy-arg "metrics-bind-address=0.0.0.0"
+        EOF
+    - name: Enable K3s Agent Systemed
+      command: systemctl enable k3s-agent --now
+      when: agent_installed is defined and agent_installed.stdout == '0'

@@ -1,0 +1,15 @@
+- hosts: k3s-master
+  remote_user: ep
+  become: yes
+  gather_facts: False
+  tasks:
+    - name: uninstall k3s-server
+      shell: which k3s-uninstall.sh > /dev/null 2>&1 && k3s-uninstall.sh || echo 'uninstalled'
+
+- hosts: k3s-workers
+  remote_user: ep
+  become: yes
+  gather_facts: False
+  tasks:
+    - name: uninstall k3s-agent
+      shell: which k3s-agent-uninstall.sh > /dev/null 2>&1 && k3s-agent-uninstall.sh || echo 'uninstalled'
